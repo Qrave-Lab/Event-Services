@@ -67,7 +67,7 @@ type publishRequest struct {
 }
 
 func main() {
-	port := envOr("EVENT_PORT", ":9091")
+	port := resolveListenAddr()
 	jwtSecret := os.Getenv("EVENT_JWT_SECRET")
 	publishSecret := os.Getenv("EVENT_SERVICE_SECRET")
 
@@ -82,6 +82,10 @@ func main() {
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("ok"))
+	})
+	http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("event-service"))
 	})
 
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
@@ -167,4 +171,18 @@ func envOr(key, fallback string) string {
 		return fallback
 	}
 	return val
+}
+
+func resolveListenAddr() string {
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port == "" {
+		port = strings.TrimSpace(os.Getenv("EVENT_PORT"))
+	}
+	if port == "" {
+		return ":9091"
+	}
+	if strings.HasPrefix(port, ":") {
+		return port
+	}
+	return ":" + port
 }
