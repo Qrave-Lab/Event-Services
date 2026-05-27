@@ -68,13 +68,17 @@ type publishRequest struct {
 
 func main() {
 	port := resolveListenAddr()
+	log.Println("Starting event-service on resolved port:", port)
+
 	jwtSecret := os.Getenv("EVENT_JWT_SECRET")
 	publishSecret := os.Getenv("EVENT_SERVICE_SECRET")
 
 	if jwtSecret == "" {
+		log.Println("CRITICAL ERROR: EVENT_JWT_SECRET environment variable is missing!")
 		log.Fatal("EVENT_JWT_SECRET is required")
 	}
 	if publishSecret == "" {
+		log.Println("CRITICAL ERROR: EVENT_SERVICE_SECRET environment variable is missing!")
 		log.Fatal("EVENT_SERVICE_SECRET is required")
 	}
 
@@ -181,7 +185,7 @@ func resolveListenAddr() string {
 	if port == "" {
 		return ":9091"
 	}
-	if strings.HasPrefix(port, ":") {
+	if strings.Contains(port, ":") {
 		return port
 	}
 	return ":" + port
