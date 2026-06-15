@@ -2,18 +2,21 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/go-redis/redis/v8"
+
 	"github.com/golang-jwt/jwt/v5"
 	"nhooyr.io/websocket"
 )
+
+var rdb *redis.Client
 
 type wsClient struct {
 	conn         *websocket.Conn
@@ -68,18 +71,26 @@ type publishRequest struct {
 
 func main() {
 	port := resolveListenAddr()
-	log.Println("Starting event-service on resolved port:", port)
+	slog.Info("Starting event-service on resolved port", "port", port)
 
 	jwtSecret := os.Getenv("EVENT_JWT_SECRET")
 	publishSecret := os.Getenv("EVENT_SERVICE_SECRET")
 
+	redisURL := os.Getenv("REDIS_URL")
+	opt, err := redis.ParseURL(redisURL)
+	if err != nil {
+		slog.Error("failed to parse redis url", "error", err)
+		os.Exit(1)
+	}
+	rdb = redis.NewClient(opt)
+
 	if jwtSecret == "" {
-		log.Println("CRITICAL ERROR: EVENT_JWT_SECRET environment variable is missing!")
-		log.Fatal("EVENT_JWT_SECRET is required")
+		slog.Error("CRITICAL ERROR: EVENT_JWT_SECRET environment variable is missing!")
+		os.Exit(1)
 	}
 	if publishSecret == "" {
-		log.Println("CRITICAL ERROR: EVENT_SERVICE_SECRET environment variable is missing!")
-		log.Fatal("EVENT_SERVICE_SECRET is required")
+		slog.Error("CRITICAL ERROR: EVENT_SERVICE_SECRET environment variable is missing!")
+		os.Exit(1)
 	}
 
 	h := newHub()
@@ -134,39 +145,60 @@ func main() {
 		for {
 			_, _, err := conn.Read(r.Context())
 			if err != nil {
-				break
-			}
+				
+		break
+			
+				}
 		}
 
 		conn.Close(websocket.StatusNormalClosure, "bye")
 	})
 
-	http.HandleFunc("/publish", func(w http.ResponseWriter, r *http.Request) {
-		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		secret := strings.TrimPrefix(auth, "Bearer ")
-		if secret != publishSecret {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
+	go func() {
+		ctx := context.Background()
+		pubsub := rdb.PSubscribe(ctx, "events:restaurant:*")
 
-		var req publishRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.RestaurantID == "" {
-			http.Error(w, "invalid request", http.StatusBadRequest)
-			return
+		defer pubsub.Close()
+		slog.Info("Listening for Redis Pub/Sub events...")
+		for msg:= range pubsub.Channel(){
+			parts:= strings.Split(msg.Channel, ":")
+			if len(parts)==3{
+				restaurantID:= parts[2]
+				h.broadcast(restaurantID, []byte(msg.Payload))
+			}
 		}
 
-		payload, _ := json.Marshal(req)
-		h.broadcast(req.RestaurantID, payload)
+	}()
 
-		w.WriteHeader(http.StatusAccepted)
-	})
+	// http.HandleFunc("/publish", func(w http.ResponseWriter, r *http.Request) {
+	// 	auth := r.Header.Get("Authorization")
+	// 	if !strings.HasPrefix(auth, "Bearer ") {
+	// 		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	// 		return
+	// 	}
+	// 	secret := strings.TrimPrefix(auth, "Bearer ")
+	// 	if secret != publishSecret {
+	// 		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	// 		return
+	// 	}
+
+	// 	var req publishRequest
+	// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.RestaurantID == "" {
+	// 		http.Error(w, "invalid request", http.StatusBadRequest)
+	// 		return
+	// 	}
+
+	// 	payload, _ := json.Marshal(req)
+	// 	h.broadcast(req.RestaurantID, payload)
+
+	// 	w.WriteHeader(http.StatusAccepted)
+	// })
 
 	fmt.Println("event-service listening on", port)
-	log.Fatal(http.ListenAndServe(port, nil))
+	if err := http.ListenAndServe(port, nil); err != nil {
+		slog.Error("server error", "error", err)
+		os.Exit(1)
+	}
 }
 
 func envOr(key, fallback string) string {
