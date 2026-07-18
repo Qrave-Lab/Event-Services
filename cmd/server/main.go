@@ -131,8 +131,13 @@ func main() {
 			return
 		}
 
+		allowedOrigins := []string{"localhost", "127.0.0.1", "*.qrave.in"}
+		if envOrigins := os.Getenv("ALLOWED_ORIGINS"); envOrigins != "" {
+			allowedOrigins = strings.Split(envOrigins, ",")
+		}
+		
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			InsecureSkipVerify: true,
+			OriginPatterns: allowedOrigins,
 		})
 		if err != nil {
 			return
