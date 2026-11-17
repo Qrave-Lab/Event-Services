@@ -52,14 +52,27 @@ func (h *hub) remove(restaurantID string, conn *websocket.Conn) {
 	}
 }
 
+// broadcast sends payload to every connection in the room in parallel, so one
+// slow or dead client can't delay everyone else (or other restaurants, since
+// this runs on the shared Redis consumer). Clients that fail a write are
+// closed; their read loop then removes them.
 func (h *hub) broadcast(restaurantID string, payload []byte) {
 	h.mu.RLock()
-	defer h.mu.RUnlock()
-	room := h.rooms[restaurantID]
-	for conn := range room {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		_ = conn.Write(ctx, websocket.MessageText, payload)
-		cancel()
+	conns := make([]*websocket.Conn, 0, len(h.rooms[restaurantID]))
+	for conn := range h.rooms[restaurantID] {
+		conns = append(conns, conn)
+	}
+	h.mu.RUnlock()
+
+	for _, conn := range conns {
+		go func(c *websocket.Conn) {
+			defer repanicReported("broadcast")
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := c.Write(ctx, websocket.MessageText, payload); err != nil {
+				c.Close(websocket.StatusGoingAway, "write failed")
+			}
+		}(conn)
 	}
 }
 
@@ -70,6 +83,7 @@ type publishRequest struct {
 }
 
 func main() {
+	flushSentry := initSentry("event-service") // inert without SENTRY_DSN
 	port := resolveListenAddr()
 	slog.Info("Starting event-service on resolved port", "port", port)
 
@@ -119,7 +133,7 @@ func main() {
 		claims := jwt.MapClaims{}
 		parsed, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (interface{}, error) {
 			return []byte(jwtSecret), nil
-		})
+		}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
 		if err != nil || !parsed.Valid {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -131,11 +145,29 @@ func main() {
 			return
 		}
 
-		allowedOrigins := []string{"localhost", "127.0.0.1", "*.qrave.in"}
-		if envOrigins := os.Getenv("ALLOWED_ORIGINS"); envOrigins != "" {
-			allowedOrigins = strings.Split(envOrigins, ",")
+		// Patterns match the Origin's host including port (e.g. the POS runs
+		// at 127.0.0.1:3010). Override with ALLOWED_ORIGINS (comma-separated).
+		// The desktop POS opens this socket from http://127.0.0.1:<port>, so
+		// loopback with a port stays allowed everywhere (a valid token is still
+		// required). The remaining localhost entries are development only: they
+		// need an explicit development APP_ENV, so production fails closed.
+		allowedOrigins := []string{
+			"127.0.0.1:*",
+			"qravetech.in", "*.qravetech.in", "qrave-website.vercel.app", "*.qrave-website.vercel.app",
 		}
-		
+		switch strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV"))) {
+		case "development", "dev", "local", "test":
+			allowedOrigins = append(allowedOrigins, "localhost", "localhost:*", "127.0.0.1")
+		}
+		if envOrigins := os.Getenv("ALLOWED_ORIGINS"); envOrigins != "" {
+			allowedOrigins = nil
+			for _, o := range strings.Split(envOrigins, ",") {
+				if o = strings.TrimSpace(o); o != "" {
+					allowedOrigins = append(allowedOrigins, o)
+				}
+			}
+		}
+
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			OriginPatterns: allowedOrigins,
 		})
@@ -147,32 +179,64 @@ func main() {
 		h.add(restaurantID, conn)
 		defer h.remove(restaurantID, conn)
 
+		// Ping regularly so hosting proxies don't drop idle connections and
+		// dead clients are noticed.
+		pingCtx, stopPing := context.WithCancel(r.Context())
+		defer stopPing()
+		go func() {
+			defer repanicReported("ws-ping")
+			t := time.NewTicker(25 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-pingCtx.Done():
+					return
+				case <-t.C:
+					ctx, cancel := context.WithTimeout(pingCtx, 10*time.Second)
+					err := conn.Ping(ctx)
+					cancel()
+					if err != nil {
+						conn.Close(websocket.StatusGoingAway, "ping timeout")
+						return
+					}
+				}
+			}
+		}()
+
 		for {
 			_, _, err := conn.Read(r.Context())
 			if err != nil {
-				
-		break
-			
-				}
+
+				break
+
+			}
 		}
 
 		conn.Close(websocket.StatusNormalClosure, "bye")
 	})
 
 	go func() {
-		ctx := context.Background()
-		pubsub := rdb.PSubscribe(ctx, "events:restaurant:*")
+		defer repanicReported("redis-subscribe")
+		for {
+			ctx := context.Background()
+			pubsub := rdb.PSubscribe(ctx, "events:restaurant:*")
 
-		defer pubsub.Close()
-		slog.Info("Listening for Redis Pub/Sub events...")
-		for msg:= range pubsub.Channel(){
-			parts:= strings.Split(msg.Channel, ":")
-			if len(parts)==3{
-				restaurantID:= parts[2]
-				h.broadcast(restaurantID, []byte(msg.Payload))
+			slog.Info("Redis Pub/Sub: subscribed to events:restaurant:*")
+			ch := pubsub.Channel()
+
+			for msg := range ch {
+				parts := strings.Split(msg.Channel, ":")
+				if len(parts) == 3 {
+					restaurantID := parts[2]
+					h.broadcast(restaurantID, []byte(msg.Payload))
+				}
 			}
-		}
 
+			// Channel closed — Redis connection was lost.
+			pubsub.Close()
+			slog.Warn("Redis Pub/Sub: connection lost — reconnecting in 3s")
+			time.Sleep(3 * time.Second)
+		}
 	}()
 
 	// http.HandleFunc("/publish", func(w http.ResponseWriter, r *http.Request) {
@@ -200,8 +264,10 @@ func main() {
 	// })
 
 	fmt.Println("event-service listening on", port)
-	if err := http.ListenAndServe(port, nil); err != nil {
+	if err := http.ListenAndServe(port, withSentry(http.DefaultServeMux)); err != nil {
 		slog.Error("server error", "error", err)
+		reportPanic(err, nil, "listen")
+		flushSentry()
 		os.Exit(1)
 	}
 }
